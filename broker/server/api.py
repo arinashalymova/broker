@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, WebSocket, Depends, BackgroundTasks, Query, Path
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks, Query, Path
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
@@ -6,13 +6,17 @@ from enum import Enum
 from datetime import datetime
 import uuid
 
+from broker.core.broker import broker
+from broker.core.message import Message as CoreMessage
+from broker.core.queue import QueueType as CoreQueueType
+
 app = FastAPI(
     title="Message Broker API",
     description="API для взаимодействия с брокером сообщений",
     version="0.1.0",
 )
 
-# Модели данных для Swagger
+# Модели данных для API
 class QueueType(str, Enum):
     FIFO = "FIFO"
     LIFO = "LIFO"
@@ -22,21 +26,24 @@ class MessageBase(BaseModel):
     content_type: str = "application/json"
     headers: Dict[str, str] = Field(default_factory=dict)
 
-class Message(MessageBase):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+class Message(BaseModel):
+    id: str
+    content: Any
+    content_type: str
+    headers: Dict[str, str]
     topic: Optional[str] = None
     queue: Optional[str] = None
-    timestamp: datetime = Field(default_factory=datetime.now)
-    status: str = "pending"
+    timestamp: str
+    status: str
 
 class TopicCreate(BaseModel):
     name: str
 
 class TopicInfo(BaseModel):
     name: str
-    subscribers: List[str] = Field(default_factory=list)
-    message_count: int = 0
-    created_at: datetime = Field(default_factory=datetime.now)
+    subscribers: List[str]
+    message_count: int
+    created_at: str
 
 class QueueCreate(BaseModel):
     name: str
@@ -44,162 +51,183 @@ class QueueCreate(BaseModel):
 
 class QueueInfo(BaseModel):
     name: str
-    type: QueueType
-    subscribers: List[str] = Field(default_factory=list)
-    message_count: int = 0
-    created_at: datetime = Field(default_factory=datetime.now)
+    type: str
+    subscribers: List[str]
+    message_count: int
+    created_at: str
 
 class SubscriptionCreate(BaseModel):
     subscriber_id: str
-    target_type: str  # "topic" или "queue"
+    target_type: str
     target_name: str
 
 class SubscriptionInfo(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: str
     subscriber_id: str
     target_type: str
     target_name: str
-    created_at: datetime = Field(default_factory=datetime.now)
-    last_message_id: Optional[str] = None
+    created_at: str
 
-# API для работы с топиками
-@app.post("/topics", response_model=TopicInfo, tags=["Topics"], summary="Создать новый топик")
-async def create_topic(topic: TopicCreate):
-    """
-    Создает новый топик для публикации сообщений.
+# === API для работы с топиками ===
+@app.post("/topics", response_model=TopicInfo, tags=["Topics"])
+async def create_topic(topic_data: TopicCreate):
+    """Создать новый топик"""
+    try:
+        topic = broker.create_topic(topic_data.name)
+        return TopicInfo(**topic.get_info())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    - **name**: Уникальное имя топика
-    """
-    return {"name": topic.name, "created_at": datetime.now()}
-
-@app.get("/topics", response_model=List[TopicInfo], tags=["Topics"], summary="Получить список всех топиков")
+@app.get("/topics", response_model=List[TopicInfo], tags=["Topics"])
 async def get_topics():
-    """
-    Возвращает список всех доступных топиков.
-    """
-    return [{"name": "example-topic", "subscribers": [], "message_count": 0, "created_at": datetime.now()}]
+    """Получить список всех топиков"""
+    topics_data = broker.get_all_topics()
+    return [TopicInfo(**topic_data) for topic_data in topics_data]
 
-@app.get("/topics/{topic_name}", response_model=TopicInfo, tags=["Topics"], summary="Получить информацию о топике")
-async def get_topic(topic_name: str = Path(..., description="Имя топика")):
-    """
-    Возвращает информацию о конкретном топике.
+@app.get("/topics/{topic_name}", response_model=TopicInfo, tags=["Topics"])
+async def get_topic(topic_name: str):
+    """Получить информацию о топике"""
+    topic = broker.get_topic(topic_name)
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    return TopicInfo(**topic.get_info())
 
-    - **topic_name**: Имя топика
-    """
-    return {"name": topic_name, "subscribers": [], "message_count": 0, "created_at": datetime.now()}
-
-@app.delete("/topics/{topic_name}", tags=["Topics"], summary="Удалить топик")
-async def delete_topic(topic_name: str = Path(..., description="Имя топика")):
-    """
-    Удаляет указанный топик.
-
-    - **topic_name**: Имя топика для удаления
-    """
+@app.delete("/topics/{topic_name}", tags=["Topics"])
+async def delete_topic(topic_name: str):
+    """Удалить топик"""
+    if not broker.delete_topic(topic_name):
+        raise HTTPException(status_code=404, detail="Topic not found")
     return {"status": "success", "message": f"Topic {topic_name} deleted"}
 
-# API для публикации сообщений
-@app.post("/topics/{topic_name}/publish", response_model=Message, tags=["Publishing"], summary="Опубликовать сообщение в топик")
-async def publish_to_topic(
-        message: MessageBase,
-        topic_name: str = Path(..., description="Имя топика для публикации"),
-        background_tasks: BackgroundTasks = None
-):
-    """
-    Публикует сообщение в указанный топик.
+# === API для публикации сообщений ===
+@app.post("/topics/{topic_name}/publish", response_model=Message, tags=["Publishing"])
+async def publish_to_topic(topic_name: str, message_data: MessageBase):
+    """Опубликовать сообщение в топик"""
+    topic = broker.get_topic(topic_name)
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found")
 
-    - **topic_name**: Имя топика
-    - **message**: Содержимое и метаданные сообщения
-    """
-    msg_id = str(uuid.uuid4())
-    return {
-        "id": msg_id,
-        "topic": topic_name,
-        "content": message.content,
-        "content_type": message.content_type,
-        "headers": message.headers,
-        "timestamp": datetime.now(),
-        "status": "delivered"
-    }
+    message = CoreMessage(
+        content=message_data.content,
+        content_type=message_data.content_type,
+        headers=message_data.headers
+    )
 
-# API для работы с очередями
-@app.post("/queues", response_model=QueueInfo, tags=["Queues"], summary="Создать новую очередь")
-async def create_queue(queue: QueueCreate):
-    """
-    Создает новую очередь для сообщений.
+    if broker.publish_to_topic(topic_name, message):
+        return Message(
+            id=message.id,
+            content=message.content,
+            content_type=message.content_type,
+            headers=message.headers,
+            topic=message.topic,
+            timestamp=message.timestamp.isoformat(),
+            status=message.status
+        )
+    else:
+        raise HTTPException(status_code=500, detail="Failed to publish message")
 
-    - **name**: Уникальное имя очереди
-    - **type**: Тип очереди (FIFO - первым пришел, первым ушел; LIFO - последним пришел, первым ушел)
-    """
-    return {
-        "name": queue.name,
-        "type": queue.type,
-        "subscribers": [],
-        "message_count": 0,
-        "created_at": datetime.now()
-    }
+# === API для работы с очередями ===
+@app.post("/queues", response_model=QueueInfo, tags=["Queues"])
+async def create_queue(queue_data: QueueCreate):
+    """Создать новую очередь"""
+    try:
+        queue_type = CoreQueueType.FIFO if queue_data.type == QueueType.FIFO else CoreQueueType.LIFO
+        queue = broker.create_queue(queue_data.name, queue_type)
+        return QueueInfo(**queue.get_info())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/queues", response_model=List[QueueInfo], tags=["Queues"], summary="Получить список всех очередей")
+@app.get("/queues", response_model=List[QueueInfo], tags=["Queues"])
 async def get_queues():
-    """
-    Возвращает список всех доступных очередей.
-    """
-    return [{
-        "name": "example-queue",
-        "type": "FIFO",
-        "subscribers": [],
-        "message_count": 0,
-        "created_at": datetime.now()
-    }]
+    """Получить список всех очередей"""
+    queues_data = broker.get_all_queues()
+    return [QueueInfo(**queue_data) for queue_data in queues_data]
 
-# API для подписок
-@app.post("/subscriptions", response_model=SubscriptionInfo, tags=["Subscriptions"], summary="Создать подписку")
-async def create_subscription(subscription: SubscriptionCreate):
-    """
-    Создает новую подписку на топик или очередь.
+@app.get("/queues/{queue_name}", response_model=QueueInfo, tags=["Queues"])
+async def get_queue(queue_name: str):
+    """Получить информацию об очереди"""
+    queue = broker.get_queue(queue_name)
+    if not queue:
+        raise HTTPException(status_code=404, detail="Queue not found")
+    return QueueInfo(**queue.get_info())
 
-    - **subscriber_id**: Идентификатор подписчика
-    - **target_type**: Тип цели (topic или queue)
-    - **target_name**: Имя топика или очереди
-    """
-    return {
-        "id": str(uuid.uuid4()),
-        "subscriber_id": subscription.subscriber_id,
-        "target_type": subscription.target_type,
-        "target_name": subscription.target_name,
-        "created_at": datetime.now()
-    }
+@app.post("/queues/{queue_name}/publish", response_model=Message, tags=["Publishing"])
+async def publish_to_queue(queue_name: str, message_data: MessageBase):
+    """Опубликовать сообщение в очередь"""
+    queue = broker.get_queue(queue_name)
+    if not queue:
+        raise HTTPException(status_code=404, detail="Queue not found")
 
-@app.get("/subscriptions/{subscriber_id}", response_model=List[SubscriptionInfo],
-         tags=["Subscriptions"], summary="Получить подписки пользователя")
-async def get_subscriptions(subscriber_id: str = Path(..., description="ID подписчика")):
-    """
-    Возвращает список всех подписок конкретного подписчика.
+    message = CoreMessage(
+        content=message_data.content,
+        content_type=message_data.content_type,
+        headers=message_data.headers
+    )
 
-    - **subscriber_id**: Идентификатор подписчика
-    """
-    return [{
-        "id": str(uuid.uuid4()),
-        "subscriber_id": subscriber_id,
-        "target_type": "topic",
-        "target_name": "example-topic",
-        "created_at": datetime.now()
-    }]
+    if broker.publish_to_queue(queue_name, message):
+        return Message(
+            id=message.id,
+            content=message.content,
+            content_type=message.content_type,
+            headers=message.headers,
+            queue=message.queue,
+            timestamp=message.timestamp.isoformat(),
+            status=message.status
+        )
+    else:
+        raise HTTPException(status_code=500, detail="Failed to publish message")
 
-# WebSocket для получения сообщений
+# === API для подписок ===
+@app.post("/subscriptions", response_model=SubscriptionInfo, tags=["Subscriptions"])
+async def create_subscription(subscription_data: SubscriptionCreate):
+    """Создать подписку"""
+    # Проверяем существование цели подписки
+    if subscription_data.target_type == "topic":
+        if not broker.get_topic(subscription_data.target_name):
+            raise HTTPException(status_code=404, detail="Topic not found")
+    elif subscription_data.target_type == "queue":
+        if not broker.get_queue(subscription_data.target_name):
+            raise HTTPException(status_code=404, detail="Queue not found")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid target_type. Must be 'topic' or 'queue'")
+
+    subscription = broker.create_subscription(
+        subscription_data.subscriber_id,
+        subscription_data.target_type,
+        subscription_data.target_name
+    )
+
+    return SubscriptionInfo(**subscription.to_dict())
+
+@app.get("/subscriptions/{subscriber_id}", response_model=List[SubscriptionInfo], tags=["Subscriptions"])
+async def get_subscriptions(subscriber_id: str):
+    """Получить подписки пользователя"""
+    subscriptions_data = broker.get_subscriptions(subscriber_id)
+    return [SubscriptionInfo(**sub_data) for sub_data in subscriptions_data]
+
+# === WebSocket для получения сообщений ===
 @app.websocket("/ws/{subscriber_id}")
 async def websocket_endpoint(websocket: WebSocket, subscriber_id: str):
-    """
-    WebSocket соединение для получения сообщений в реальном времени.
-    """
+    """WebSocket соединение для получения сообщений"""
     await websocket.accept()
+
+    # Создаем или получаем подписчика с WebSocket
+    subscriber = broker.create_subscriber(subscriber_id, websocket)
+
     try:
         while True:
-            # Здесь будет логика отправки сообщений подписчику
-            await websocket.send_json({"message": "Test message", "timestamp": str(datetime.now())})
-            # В реальном коде нужно будет дожидаться появления новых сообщений
-            await websocket.receive_text()  # Блокирующий вызов для поддержания соединения
-    except:
-        await websocket.close()
+            # Ждем сообщения от клиента (для поддержания соединения)
+            data = await websocket.receive_text()
+            # Можно добавить обработку команд от клиента здесь
+    except WebSocketDisconnect:
+        # Клиент отключился
+        print(f"WebSocket disconnected for subscriber {subscriber_id}")
+    except Exception as e:
+        print(f"WebSocket error for subscriber {subscriber_id}: {e}")
+    finally:
+        # Убираем WebSocket из подписчика
+        if subscriber_id in broker.subscribers:
+            broker.subscribers[subscriber_id].websocket = None
 
 if __name__ == "__main__":
     import uvicorn
