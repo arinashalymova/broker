@@ -1,6 +1,3 @@
-"""
-Простой тест брокера с использованием requests
-"""
 import requests
 import json
 import time
@@ -21,7 +18,6 @@ class SimpleBrokerClient:
             return {"error": str(e)}
 
     def create_queue(self, name: str, queue_type: str = "FIFO"):
-        """Создать очередь"""
         try:
             response = requests.post(
                 f"{self.base_url}/queues",
@@ -32,7 +28,6 @@ class SimpleBrokerClient:
             return {"error": str(e)}
 
     def subscribe(self, subscriber_id: str, target_type: str, target_name: str):
-        """Создать подписку"""
         try:
             response = requests.post(
                 f"{self.base_url}/subscriptions",
@@ -47,7 +42,6 @@ class SimpleBrokerClient:
             return {"error": str(e)}
 
     def publish_to_topic(self, topic_name: str, content, headers=None):
-        """Опубликовать сообщение в топик"""
         if headers is None:
             headers = {}
 
@@ -65,7 +59,6 @@ class SimpleBrokerClient:
             return {"error": str(e)}
 
     def publish_to_queue(self, queue_name: str, content, headers=None):
-        """Опубликовать сообщение в очередь"""
         if headers is None:
             headers = {}
 
@@ -83,7 +76,6 @@ class SimpleBrokerClient:
             return {"error": str(e)}
 
     def get_topics(self):
-        """Получить список топиков"""
         try:
             response = requests.get(f"{self.base_url}/topics")
             return response.json()
@@ -91,7 +83,6 @@ class SimpleBrokerClient:
             return {"error": str(e)}
 
     def get_queues(self):
-        """Получить список очередей"""
         try:
             response = requests.get(f"{self.base_url}/queues")
             return response.json()
@@ -99,24 +90,20 @@ class SimpleBrokerClient:
             return {"error": str(e)}
 
 def test_pub_sub():
-    """Тестирование pub/sub функциональности"""
     print("=== Тестирование Pub/Sub ===")
 
     client = SimpleBrokerClient()
 
-    # Создаем топик
     print("1. Создание топика 'news'...")
     topic_result = client.create_topic("news")
     print(f"   Результат: {topic_result}")
 
-    # Создаем подписки
     print("2. Создание подписок...")
     sub1 = client.subscribe("subscriber-1", "topic", "news")
     sub2 = client.subscribe("subscriber-2", "topic", "news")
     print(f"   Подписчик 1: {sub1}")
     print(f"   Подписчик 2: {sub2}")
 
-    # Публикуем сообщения
     print("3. Публикация сообщений...")
     msg1 = client.publish_to_topic("news", {
         "title": "Важная новость!",
@@ -130,25 +117,21 @@ def test_pub_sub():
     })
     print(f"   Сообщение 2: {msg2}")
 
-    # Проверяем состояние топика
     print("4. Проверка топиков...")
     topics = client.get_topics()
     print(f"   Топики: {topics}")
 
 def test_queue():
-    """Тестирование очередей"""
     print("\n=== Тестирование очередей ===")
 
     client = SimpleBrokerClient()
 
-    # Создаем очереди
     print("1. Создание очередей...")
     fifo_queue = client.create_queue("tasks", "FIFO")
     lifo_queue = client.create_queue("urgent-tasks", "LIFO")
     print(f"   FIFO очередь: {fifo_queue}")
     print(f"   LIFO очередь: {lifo_queue}")
 
-    # Создаем подписки
     print("2. Создание подписок...")
     worker1 = client.subscribe("worker-1", "queue", "tasks")
     worker2 = client.subscribe("worker-2", "queue", "tasks")
@@ -157,7 +140,6 @@ def test_queue():
     print(f"   Воркер 2: {worker2}")
     print(f"   Срочный воркер: {urgent_worker}")
 
-    # Публикуем задачи в FIFO очередь
     print("3. Публикация задач в FIFO очередь...")
     for i in range(3):
         task = client.publish_to_queue("tasks", {
@@ -166,13 +148,11 @@ def test_queue():
         })
         print(f"   Задача {i + 1}: {task}")
 
-    # Проверяем состояние очередей
     print("4. Проверка очередей...")
     queues = client.get_queues()
     print(f"   Очереди: {queues}")
 
 def test_server_connection():
-    """Проверить подключение к серверу"""
     print("=== Проверка подключения к серверу ===")
     try:
         response = requests.get("http://localhost:8000")
@@ -191,10 +171,8 @@ def test_server_connection():
         return False
 
 def main():
-    """Основная функция демонстрации"""
     print("Запуск демонстрации брокера сообщений...")
 
-    # Проверяем подключение к серверу
     if not test_server_connection():
         return
 

@@ -10,7 +10,6 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Добавляем CORS для возможности обращения к API из браузера
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,7 +18,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Включаем API в основной сервер
 app.mount("/api/v1", api_app)
 
 @app.get("/")

@@ -6,8 +6,8 @@ from .message import Message
 import threading
 
 class QueueType(Enum):
-    FIFO = "FIFO"  # First In, First Out
-    LIFO = "LIFO"  # Last In, First Out
+    FIFO = "FIFO"
+    LIFO = "LIFO"
 
 class Queue:
     def __init__(self, name: str, queue_type: QueueType = QueueType.FIFO):

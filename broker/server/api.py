@@ -16,7 +16,6 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Модели данных для API
 class QueueType(str, Enum):
     FIFO = "FIFO"
     LIFO = "LIFO"
@@ -218,7 +217,6 @@ async def websocket_endpoint(websocket: WebSocket, subscriber_id: str):
         while True:
             # Ждем сообщения от клиента (для поддержания соединения)
             data = await websocket.receive_text()
-            # Можно добавить обработку команд от клиента здесь
     except WebSocketDisconnect:
         # Клиент отключился
         print(f"WebSocket disconnected for subscriber {subscriber_id}")

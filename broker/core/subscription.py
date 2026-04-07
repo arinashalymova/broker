@@ -23,13 +23,10 @@ class Subscriber:
         self.last_message_id = message.id
 
         if self.websocket:
-            # Отправляем через WebSocket
             asyncio.create_task(self._send_websocket_message(message))
         elif self.message_callback:
-            # Вызываем callback
             self.message_callback(message)
         else:
-            # Логируем для демонстрации
             print(f"Message delivered to subscriber {self.id}: {message.content}")
 
     async def _send_websocket_message(self, message: Message):
@@ -44,7 +41,7 @@ class Subscription:
     def __init__(self, subscriber_id: str, target_type: str, target_name: str):
         self.id = str(uuid.uuid4())
         self.subscriber_id = subscriber_id
-        self.target_type = target_type  # "topic" or "queue"
+        self.target_type = target_type
         self.target_name = target_name
         self.created_at = datetime.now()
 
