@@ -15,9 +15,8 @@ class Metrics:
     messages_expired: int = 0
     messages_in_dlq: int = 0
 
-    # Счетчики по топикам/очередям
+    # Счетчики по топикам/подписчикам
     topics_count: int = 0
-    queues_count: int = 0
     subscribers_count: int = 0
 
     # Производительность
@@ -65,11 +64,10 @@ class Metrics:
         with self._lock:
             self.messages_in_dlq += 1
 
-    def update_counts(self, topics: int, queues: int, subscribers: int):
-        """Обновить счетчики топиков/очередей/подписчиков"""
+    def update_counts(self, topics: int, subscribers: int):
+        """Обновить счетчики топиков/подписчиков"""
         with self._lock:
             self.topics_count = topics
-            self.queues_count = queues
             self.subscribers_count = subscribers
 
     def _update_performance(self):
@@ -101,7 +99,6 @@ class Metrics:
                 },
                 "entities": {
                     "topics": self.topics_count,
-                    "queues": self.queues_count,
                     "subscribers": self.subscribers_count
                 },
                 "performance": {

@@ -1,81 +1,139 @@
-Модульная структура брокера:
+Архитектура SHA Message Broker v2.0
+=====================================
 
-message-broker/
-├── broker/
+Структура модулей:
+
+sha_broker/broker/
+├── broker/                         # Основной пакет брокера
 │   ├── __init__.py
 │   ├── core/
-│   │   ├── __init__.py
-│   │   ├── message.py      # Класс сообщения и его метаданные
-│   │   ├── topic.py        # Управление топиками
-│   │   ├── queue.py        # Управление очередями
-│   │   └── subscription.py # Управление подписками
+│   │   ├── message.py              # Класс Message: offset, client_message_id, from_dict()
+│   │   ├── topic.py                # Topic: pub/sub, in-flight, 3s ACK timeout, replay
+│   │   ├── subscription.py         # Subscriber (WS + callback), Subscription
+│   │   ├── broker.py               # MessageBroker: dedup LRU, restore, ACK routing, retry loop
+│   │   ├── config.py               # BrokerConfig (dataclass)
+│   │   ├── dead_letter_queue.py    # DeadLetterQueue
+│   │   └── metrics.py              # Metrics (counters, performance)
 │   ├── persistence/
 │   │   ├── __init__.py
-│   │   ├── storage.py      # Абстрактный класс для хранения
-│   │   └── file_storage.py # Файловое хранилище сообщений
+│   │   └── storage.py              # JsonlLogStorage: append+fsync, offsets, meta, dedup cache
 │   ├── server/
 │   │   ├── __init__.py
-│   │   ├── api.py          # REST API обработчики
-│   │   └── server.py       # Основной HTTP сервер
+│   │   ├── api.py                  # FastAPI роутер + WebSocket эндпоинты
+│   │   └── server.py               # uvicorn запуск, CORS
 │   └── utils/
-│       ├── __init__.py
-│       └── logger.py       # Утилита логирования
-├── client/
-│   ├── __init__.py
-│   ├── publisher.py        # Клиент для публикации сообщений
-│   └── subscriber.py       # Клиент для подписки на сообщения
+│       └── __init__.py
+├── client/                         # Python SDK
+│   ├── __init__.py                 # from client import BrokerPublisher, BrokerSubscriber
+│   ├── publisher.py                # BrokerPublisher: auto-retry 5s, client_message_id
+│   └── subscriber.py               # BrokerSubscriber: WS, ACK, деdup, reconnect
 ├── examples/
-│   ├── publisher_demo.py   # Пример публикации сообщений
-│   └── subscriber_demo.py  # Пример подписки на сообщения
+│   ├── microservices/
+│   │   ├── publisher_service.py    # Демо-микросервис: публикует order каждые 2с
+│   │   ├── subscriber_service_a.py # Демо-микросервис: обрабатывает orders (processor)
+│   │   └── subscriber_service_b.py # Демо-микросервис: обрабатывает orders (auditor)
+│   ├── test_persistence.py         # Демо рестарта: at-least-once + producer dedup
+│   ├── enhanced_demo.py            # Демо приоритетов, TTL, DLQ, метрик
+│   └── test_broker.py              # Smoke-тест pub/sub
 ├── tests/
-│   ├── __init__.py
 │   ├── test_broker.py
 │   └── test_client.py
+├── Dockerfile                      # python:3.11-slim, VOLUME /app/data
+├── docker-compose.yml              # broker + publisher + subscriber-a + subscriber-b
 ├── requirements.txt
-├── setup.py
+├── run.py                          # точка входа: python run.py
 └── README.md
 
 
-Логические компоненты:
+Слои системы:
+=============
 
-1. Ядро брокера:
-   - Message - класс для представления сообщений с метаданными
-   - Topic - управление топиками и публикацией сообщений
-   - Queue - управление очередями по принципам FIFO/LIFO
-   - Subscription - управление подписками клиентов
+1. API Layer (broker/server/api.py)
+   - FastAPI с Swagger UI на /api/v1/docs
+   - REST эндпоинты для управления топиками и подписками
+   - POST /ack — явное подтверждение доставки
+   - WS /ws/{subscriber_id} — push-уведомления + ACK по сокету
 
-2. Персистентность:
-   - Storage - абстрактный класс для хранения данных
-   - FileStorage - реализация хранилища на базе файловой системы
+2. Core Layer (broker/core/)
+   - MessageBroker — оркестратор: создание/удаление каналов, маршрутизация публикаций,
+     ACK, метаданные, фоновые потоки (retry каждые 0.5с, cleanup каждые 60с)
+   - Topic — pub/sub: fan-out всем подписчикам, in_flight dict, replay по offset
+   - Subscriber — абстракция получателя: WS (через asyncio event loop из потока)
+     или callback (для embedded тестов)
 
-3. API сервер:
-   - REST API для взаимодействия с брокером
-   - WebSocket для реализации push-уведомлений подписчикам
+3. Persistence Layer (broker/persistence/storage.py)
+   - JsonlLogStorage: каждое сообщение — одна строка JSON с fsync
+   - Структура на диске:
+       data/
+         meta.json                     ← реестр (восстановление после перезапуска)
+         topics/<name>/messages.jsonl  ← append-only лог
+         offsets/<sub>/<type>__<name>.json  ← позиция чтения подписчика
+         dedup/producer.json           ← LRU кэш {client_msg_id: server_msg_id}
 
-4. Клиентская библиотека:
-   - Классы для удобной публикации сообщений
-   - Классы для подписки и получения сообщений
+4. SDK Layer (client/)
+   - BrokerPublisher:
+     * генерирует client_message_id (UUID) если не передан
+     * POST с timeout=5s; при ошибке — экспоненциальный retry (0.5 → 1 → 2с)
+     * возвращает (message_id, offset)
+   - BrokerSubscriber:
+     * WebSocket подключение к /api/v1/ws/{subscriber_id}
+     * при connect — отправляет subscribe-фреймы, брокер делает replay
+     * после callback — отправляет ACK (или не ACKит при ошибке → retry брокера)
+     * seen_ids set — дедупликация повторов
 
 
+Потоки данных:
+==============
 
-План разработки:
+Публикация (at-least-once, producer side):
+  Publisher SDK
+    → POST /topics/{name}/publish {content, client_message_id}
+    → ProducerDedupCache.check(client_message_id)
+        если найден → вернуть cached {message_id, offset}  (dedup)
+        если новый  → Message.create() → Topic.publish_message()
+                        → JsonlLogStorage.append() [fsync]  → offset
+                        → _deliver_to_all(): в in_flight + Subscriber.deliver_message()
+                        → return {message_id, offset}
+    ← SDK: если timeout/5xx → retry с тем же client_message_id (broker dedup)
 
-Этап 1: Проектирование и документация
-1. Завершение архитектурного проектирования
-2. Определение структуры данных
-3. Выбор технологий
-4. Документирование
+Доставка (at-least-once, consumer side):
+  Broker
+    → Subscriber.deliver_message(msg)
+        → asyncio.run_coroutine_threadsafe(ws.send_json(msg), loop)
+    Subscriber SDK
+       ← WS frame {id, offset, content, topic, ...}
+        → callback(msg)
+        → WS send {"action": "ack", "message_id": msg_id, ...}
+    Broker
+        ← ACK → topic.ack(sub_id, msg_id)
+                   → remove from in_flight
+                   → save offset to disk
+  Retry loop (каждые 0.5с):
+    для каждого in_flight[(sub_id, msg_id)]:
+      если now - sent_at > 3с:
+        retry_count < max_retries → re-deliver (та же запись in_flight)
+        retry_count == max_retries → DLQ, remove from in_flight
 
-Этап 2: Базовая функциональность
-1. Создание базовых классов для сообщений и топиков
-2. Реализация публикации и подписки
-3. Реализация очередей (FIFO/LIFO)
-4. Разработка REST API для базовых операций
-5. Базовое управление множественными подписчиками
+Восстановление после перезапуска:
+  Broker.__init__
+    → JsonlLogStorage.load_meta()           ← список топиков/подписок
+    → Topic.load_from_storage()             ← читает messages.jsonl в in-memory deque
+    → restore subscribers from meta
+    → load_dedup_cache()                    ← восстановить LRU dedup
+  При переподключении подписчика (WS):
+    → {"action": "subscribe", ...}
+    → broker.create_subscription() → topic.add_subscriber(replay=True)
+    → load_offset(sub_id) → replay messages[saved_offset+1:]
 
-Этап 3: Реализация дополнительных функций и тестирование
-1. Реализация персистентности (сохранение на диск)
-2. Обеспечение восстановления после перезапуска
-3. Гарантия доставки сообщений (at-least-once)
-4. Реализация простого TTL для сообщений
-5. Тестирование функциональности
+
+Гарантии:
+=========
+- At-least-once delivery: сообщение остаётся в in_flight до получения ACK.
+  Если ACK не пришёл за 3с — retry с тем же message_id.
+- Producer idempotency: client_message_id дедуплицируется на брокере
+  (LRU OrderedDict, 10 000 записей, персистентен на диске).
+- Consumer idempotency: SDK хранит seen_ids (LRU, 10 000) для защиты от повторной
+  обработки при broker retry.
+- Durability: каждая запись в JSONL сопровождается flush+fsync.
+- Offset recovery: при рестарте потребитель получает только новые сообщения
+  (сохранённый offset читается из data/offsets/).

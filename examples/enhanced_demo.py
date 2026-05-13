@@ -144,50 +144,6 @@ class EnhancedBrokerDemo:
         else:
             print(f"   ❌ Ошибка получения метрик: {response.status_code}")
 
-    def demo_queues(self):
-        """Демонстрация очередей FIFO/LIFO"""
-        print("\n📋 === ДЕМОНСТРАЦИЯ ОЧЕРЕДЕЙ ===")
-
-        print("1. Создание FIFO и LIFO очередей...")
-
-        # Создаем очереди
-        requests.post(f"{self.base_url}/queues", json={"name": "fifo-demo", "type": "FIFO"})
-        requests.post(f"{self.base_url}/queues", json={"name": "lifo-demo", "type": "LIFO"})
-
-        # Создаем подписчиков
-        requests.post(f"{self.base_url}/subscriptions", json={
-            "subscriber_id": "fifo-worker",
-            "target_type": "queue",
-            "target_name": "fifo-demo"
-        })
-        requests.post(f"{self.base_url}/subscriptions", json={
-            "subscriber_id": "lifo-worker",
-            "target_type": "queue",
-            "target_name": "lifo-demo"
-        })
-
-        print("2. Публикация в FIFO очередь...")
-        for i in range(5):
-            payload = {
-                "content": {"task": f"FIFO задача {i+1}"},
-                "headers": {"queue_type": "FIFO"}
-            }
-            response = requests.post(f"{self.base_url}/queues/fifo-demo/publish", json=payload)
-            if response.status_code == 200:
-                print(f"   ✅ FIFO задача {i+1}")
-
-        print("3. Публикация в LIFO очередь...")
-        for i in range(5):
-            payload = {
-                "content": {"task": f"LIFO задача {i+1}"},
-                "headers": {"queue_type": "LIFO"}
-            }
-            response = requests.post(f"{self.base_url}/queues/lifo-demo/publish", json=payload)
-            if response.status_code == 200:
-                print(f"   ✅ LIFO задача {i+1}")
-
-        print("   💡 Проверьте логи сервера для порядка обработки!")
-
     def demo_config(self):
         """Демонстрация конфигурации"""
         print("\n⚙️ === ДЕМОНСТРАЦИЯ КОНФИГУРАЦИИ ===")
@@ -198,7 +154,7 @@ class EnhancedBrokerDemo:
 
             print("Текущая конфигурация брокера:")
             important_params = [
-                "max_topics", "max_queues", "enable_dlq", "default_message_ttl",
+                "max_topics", "enable_dlq", "default_message_ttl",
                 "max_retry_attempts", "cleanup_interval", "dlq_max_size"
             ]
 
@@ -232,7 +188,6 @@ def main():
         demo.demo_metrics()
         demo.demo_priorities()
         demo.demo_ttl()
-        demo.demo_queues()
         demo.demo_dlq()
 
         print("\n" + "=" * 70)

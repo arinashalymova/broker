@@ -1,0 +1,68 @@
+version: "3.9"
+
+services:
+  # ── Broker ─────────────────────────────────────────────────────────────────
+  broker:
+    build: .
+    container_name: sha-broker
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist messages/offsets/meta across restarts
+      - broker_data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Publisher microservice ─────────────────────────────────────────────────
+  publisher:
+    build: .
+    container_name: sha-publisher
+    command: python -m examples.microservices.publisher_service
+    environment:
+      - BROKER_URL=http://broker:8000/api/v1
+      - PUBLISH_INTERVAL=2
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      broker:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Subscriber A (order processor) ────────────────────────────────────────
+  subscriber-a:
+    build: .
+    container_name: sha-subscriber-a
+    command: python -m examples.microservices.subscriber_service_a
+    environment:
+      - BROKER_URL=http://broker:8000
+      - SUBSCRIBER_ID=subscriber-a
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      broker:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Subscriber B (auditor) ────────────────────────────────────────────────
+  subscriber-b:
+    build: .
+    container_name: sha-subscriber-b
+    command: python -m examples.microservices.subscriber_service_b
+    environment:
+      - BROKER_URL=http://broker:8000
+      - SUBSCRIBER_ID=subscriber-b
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      broker:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  broker_data:
+    driver: local

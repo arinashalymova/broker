@@ -25,7 +25,6 @@ class BrokerConfig:
 
     # Настройки производительности
     max_topics: int = 1000
-    max_queues: int = 1000
     max_subscribers_per_topic: int = 100
 
     def to_dict(self):
@@ -42,6 +41,5 @@ class BrokerConfig:
             "enable_dlq": self.enable_dlq,
             "dlq_max_size": self.dlq_max_size,
             "max_topics": self.max_topics,
-            "max_queues": self.max_queues,
             "max_subscribers_per_topic": self.max_subscribers_per_topic
         }

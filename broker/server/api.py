@@ -1,25 +1,26 @@
+import asyncio
+import json
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Any
-from enum import Enum
-from datetime import datetime
-import uuid
 
 from broker.core.broker import broker
-from broker.core.message import Message as CoreMessage, MessagePriority
-from broker.core.queue import QueueType as CoreQueueType
+from broker.core.message import MessagePriority
 
 app = FastAPI(
-    title="Message Broker API - Enhanced",
-    description="Производственный брокер сообщений с приоритетами, TTL, DLQ и метриками",
-    version="1.0.0",
+    title="Message Broker API",
+    description=(
+        "Брокер сообщений с pub/sub, персистентностью, "
+        "гарантией доставки (at-least-once) и дедупликацией."
+    ),
+    version="2.0.0",
 )
 
-# === МОДЕЛИ ===
 
-class QueueType(str, Enum):
-    FIFO = "FIFO"
-    LIFO = "LIFO"
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
 class Priority(str, Enum):
     LOW = "LOW"
@@ -27,15 +28,28 @@ class Priority(str, Enum):
     HIGH = "HIGH"
     CRITICAL = "CRITICAL"
 
-class MessageBase(BaseModel):
+
+PRIORITY_MAP = {
+    Priority.LOW: MessagePriority.LOW,
+    Priority.NORMAL: MessagePriority.NORMAL,
+    Priority.HIGH: MessagePriority.HIGH,
+    Priority.CRITICAL: MessagePriority.CRITICAL,
+}
+
+
+class MessageBody(BaseModel):
     content: Any
     content_type: str = "application/json"
     headers: Dict[str, str] = Field(default_factory=dict)
     priority: Priority = Priority.NORMAL
     ttl_seconds: Optional[int] = None
+    # Idempotency key from producer (optional)
+    client_message_id: Optional[str] = None
+
 
 class TopicCreate(BaseModel):
     name: str
+
 
 class TopicInfo(BaseModel):
     name: str
@@ -43,251 +57,234 @@ class TopicInfo(BaseModel):
     message_count: int
     created_at: str
 
-class QueueCreate(BaseModel):
-    name: str
-    type: QueueType = QueueType.FIFO
-
-class QueueInfo(BaseModel):
-    name: str
-    type: str
-    subscribers: List[str]
-    message_count: int
-    created_at: str
 
 class SubscriptionCreate(BaseModel):
     subscriber_id: str
     target_type: str
     target_name: str
 
-# === БАЗОВЫЕ ЭНДПОИНТЫ ===
 
-@app.post("/topics", response_model=TopicInfo, tags=["Topics"], summary="Создать топик")
-async def create_topic(topic_data: TopicCreate):
-    """Создать новый топик"""
+class AckRequest(BaseModel):
+    subscriber_id: str
+    channel_type: str   # "topic"
+    channel_name: str
+    message_id: str
+
+
+# ── Topics ────────────────────────────────────────────────────────────────────
+
+@app.post("/topics", response_model=TopicInfo, tags=["Topics"])
+async def create_topic(body: TopicCreate):
     try:
-        topic = broker.create_topic(topic_data.name)
+        topic = broker.create_topic(body.name)
         return TopicInfo(**topic.get_info())
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, str(e))
 
-@app.get("/topics", response_model=List[TopicInfo], tags=["Topics"], summary="Получить все топики")
+
+@app.get("/topics", response_model=List[TopicInfo], tags=["Topics"])
 async def get_topics():
-    """Получить список всех топиков"""
-    topics_data = broker.get_all_topics()
-    return [TopicInfo(**topic_data) for topic_data in topics_data]
+    return [TopicInfo(**t) for t in broker.get_all_topics()]
 
-@app.get("/topics/{topic_name}", response_model=TopicInfo, tags=["Topics"], summary="Получить топик")
+
+@app.get("/topics/{topic_name}", response_model=TopicInfo, tags=["Topics"])
 async def get_topic(topic_name: str):
-    """Получить информацию о топике"""
     topic = broker.get_topic(topic_name)
     if not topic:
-        raise HTTPException(status_code=404, detail="Topic not found")
+        raise HTTPException(404, "Topic not found")
     return TopicInfo(**topic.get_info())
 
-@app.delete("/topics/{topic_name}", tags=["Topics"], summary="Удалить топик")
+
+@app.delete("/topics/{topic_name}", tags=["Topics"])
 async def delete_topic(topic_name: str):
-    """Удалить топик"""
     if not broker.delete_topic(topic_name):
-        raise HTTPException(status_code=404, detail="Topic not found")
-    return {"status": "success", "message": f"Topic {topic_name} deleted"}
+        raise HTTPException(404, "Topic not found")
+    return {"status": "deleted", "topic": topic_name}
 
-# === РАСШИРЕННАЯ ПУБЛИКАЦИЯ ===
 
-@app.post("/topics/{topic_name}/publish", tags=["Publishing"],
-          summary="Публикация с приоритетом и TTL")
-async def publish_to_topic_enhanced(topic_name: str, message_data: MessageBase):
+# ── Publish to topic ──────────────────────────────────────────────────────────
+
+@app.post("/topics/{topic_name}/publish", tags=["Publishing"])
+async def publish_to_topic(topic_name: str, body: MessageBody):
     """
-    Опубликовать сообщение в топик с расширенными возможностями:
-    - Приоритеты: LOW, NORMAL, HIGH, CRITICAL
-    - TTL (Time To Live) в секундах
-    - Дополнительные заголовки
+    Publish a message to a topic.
+
+    - `client_message_id` (optional): idempotency key — if the same key is
+      sent again within the dedup window the broker returns the original
+      message_id without storing a duplicate.
+    - Response includes `message_id` and `offset` for at-least-once tracking.
     """
     topic = broker.get_topic(topic_name)
     if not topic:
-        raise HTTPException(status_code=404, detail="Topic not found")
+        raise HTTPException(404, "Topic not found")
 
-    # Конвертируем приоритет
-    priority_mapping = {
-        Priority.LOW: MessagePriority.LOW,
-        Priority.NORMAL: MessagePriority.NORMAL,
-        Priority.HIGH: MessagePriority.HIGH,
-        Priority.CRITICAL: MessagePriority.CRITICAL
-    }
-
-    success = broker.publish_to_topic(
+    result = broker.publish_to_topic(
         topic_name,
-        message_data.content,
-        priority=priority_mapping[message_data.priority],
-        ttl_seconds=message_data.ttl_seconds,
-        headers=message_data.headers
+        body.content,
+        priority=PRIORITY_MAP[body.priority],
+        ttl_seconds=body.ttl_seconds,
+        headers=body.headers,
+        client_message_id=body.client_message_id,
     )
-
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to publish message")
+    if result is None:
+        raise HTTPException(500, "Publish failed")
 
     return {
         "status": "published",
         "topic": topic_name,
-        "priority": message_data.priority.value,
-        "ttl_seconds": message_data.ttl_seconds,
-        "timestamp": datetime.now().isoformat()
+        "message_id": result["message_id"],
+        "offset": result["offset"],
+        "deduplicated": result.get("deduplicated", False),
+        "timestamp": datetime.now().isoformat(),
     }
 
-# === ОЧЕРЕДИ ===
 
-@app.post("/queues", response_model=QueueInfo, tags=["Queues"], summary="Создать очередь")
-async def create_queue(queue_data: QueueCreate):
-    """Создать новую очередь (FIFO или LIFO)"""
-    try:
-        queue_type = CoreQueueType.FIFO if queue_data.type == QueueType.FIFO else CoreQueueType.LIFO
-        queue = broker.create_queue(queue_data.name, queue_type)
-        return QueueInfo(**queue.get_info())
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+# ── Subscriptions ─────────────────────────────────────────────────────────────
 
-@app.get("/queues", response_model=List[QueueInfo], tags=["Queues"], summary="Получить все очереди")
-async def get_queues():
-    """Получить список всех очередей"""
-    queues_data = broker.get_all_queues()
-    return [QueueInfo(**queue_data) for queue_data in queues_data]
+@app.post("/subscriptions", tags=["Subscriptions"])
+async def create_subscription(body: SubscriptionCreate):
+    if body.target_type != "topic":
+        raise HTTPException(400, "target_type must be 'topic'")
+    if not broker.get_topic(body.target_name):
+        raise HTTPException(404, "Topic not found")
 
-@app.post("/queues/{queue_name}/publish", tags=["Publishing"],
-          summary="Публикация в очередь")
-async def publish_to_queue_enhanced(queue_name: str, message_data: MessageBase):
-    """Опубликовать сообщение в очередь с приоритетом и TTL"""
-    queue = broker.get_queue(queue_name)
-    if not queue:
-        raise HTTPException(status_code=404, detail="Queue not found")
-
-    priority_mapping = {
-        Priority.LOW: MessagePriority.LOW,
-        Priority.NORMAL: MessagePriority.NORMAL,
-        Priority.HIGH: MessagePriority.HIGH,
-        Priority.CRITICAL: MessagePriority.CRITICAL
-    }
-
-    success = broker.publish_to_queue(
-        queue_name,
-        message_data.content,
-        priority=priority_mapping[message_data.priority],
-        ttl_seconds=message_data.ttl_seconds,
-        headers=message_data.headers
+    sub = broker.create_subscription(
+        body.subscriber_id, body.target_type, body.target_name
     )
+    return sub.to_dict()
 
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to publish message")
 
-    return {
-        "status": "queued",
-        "queue": queue_name,
-        "priority": message_data.priority.value,
-        "timestamp": datetime.now().isoformat()
-    }
-
-# === ПОДПИСКИ ===
-
-@app.post("/subscriptions", tags=["Subscriptions"], summary="Создать подписку")
-async def create_subscription(subscription_data: SubscriptionCreate):
-    """Создать подписку на топик или очередь"""
-    if subscription_data.target_type == "topic":
-        if not broker.get_topic(subscription_data.target_name):
-            raise HTTPException(status_code=404, detail="Topic not found")
-    elif subscription_data.target_type == "queue":
-        if not broker.get_queue(subscription_data.target_name):
-            raise HTTPException(status_code=404, detail="Queue not found")
-    else:
-        raise HTTPException(status_code=400, detail="target_type must be 'topic' or 'queue'")
-
-    subscription = broker.create_subscription(
-        subscription_data.subscriber_id,
-        subscription_data.target_type,
-        subscription_data.target_name
-    )
-
-    return subscription.to_dict()
-
-@app.get("/subscriptions/{subscriber_id}", tags=["Subscriptions"], summary="Получить подписки")
+@app.get("/subscriptions/{subscriber_id}", tags=["Subscriptions"])
 async def get_subscriptions(subscriber_id: str):
-    """Получить все подписки пользователя"""
-    subscriptions_data = broker.get_subscriptions(subscriber_id)
-    return subscriptions_data
+    return broker.get_subscriptions(subscriber_id)
 
-# === МОНИТОРИНГ И МЕТРИКИ ===
 
-@app.get("/health", tags=["Monitoring"], summary="Проверка состояния")
-async def health_check():
-    """Проверка состояния брокера"""
-    metrics = broker.get_metrics()
+# ── ACK endpoint ──────────────────────────────────────────────────────────────
+
+@app.post("/ack", tags=["Delivery"])
+async def acknowledge_message(body: AckRequest):
+    """
+    Acknowledge delivery of a message.
+
+    Call this after successfully processing a message received via REST poll.
+    WebSocket subscribers send ACK directly over the socket.
+    """
+    ok = broker.ack(
+        body.subscriber_id, body.channel_type, body.channel_name, body.message_id
+    )
+    if not ok:
+        raise HTTPException(404, "Channel not found")
+    return {"status": "acked", "message_id": body.message_id}
+
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["Monitoring"])
+async def health():
+    m = broker.get_metrics()
     return {
         "status": "healthy",
-        "uptime_seconds": metrics["performance"]["uptime_seconds"],
-        "topics": metrics["entities"]["topics"],
-        "queues": metrics["entities"]["queues"],
-        "subscribers": metrics["entities"]["subscribers"],
-        "version": "1.0.0"
+        "uptime_seconds": m["performance"]["uptime_seconds"],
+        "topics": m["entities"]["topics"],
+        "subscribers": m["entities"]["subscribers"],
+        "version": "2.0.0",
     }
 
-@app.get("/metrics", tags=["Monitoring"], summary="Получить метрики")
+
+@app.get("/metrics", tags=["Monitoring"])
 async def get_metrics():
-    """
-    Получить подробные метрики брокера:
-    - Статистика сообщений (опубликовано, доставлено, ошибки)
-    - Количество сущностей (топики, очереди, подписчики)
-    - Метрики производительности (скорость, время доставки)
-    """
     return broker.get_metrics()
 
-# === DEAD LETTER QUEUE ===
 
-@app.get("/dlq", tags=["Dead Letter Queue"], summary="Получить DLQ")
-async def get_dlq_messages():
-    """Получить сообщения из Dead Letter Queue"""
-    return broker.get_dlq_info()
-
-@app.post("/dlq/{message_id}/reprocess", tags=["Dead Letter Queue"],
-          summary="Переобработать сообщение")
-async def reprocess_dlq_message(message_id: str):
-    """Переместить сообщение из DLQ обратно для обработки"""
-    if broker.dlq and broker.dlq.reprocess_message(message_id):
-        return {"status": "success", "message": f"Message {message_id} reprocessed"}
-    raise HTTPException(status_code=404, detail="Message not found in DLQ")
-
-@app.delete("/dlq", tags=["Dead Letter Queue"], summary="Очистить DLQ")
-async def clear_dlq():
-    """Очистить Dead Letter Queue"""
-    if broker.dlq:
-        broker.dlq.clear()
-        return {"status": "success", "message": "DLQ cleared"}
-    raise HTTPException(status_code=404, detail="DLQ not available")
-
-# === КОНФИГУРАЦИЯ ===
-
-@app.get("/config", tags=["Configuration"], summary="Получить конфигурацию")
+@app.get("/config", tags=["Monitoring"])
 async def get_config():
-    """Получить текущую конфигурацию брокера"""
     return broker.config.to_dict()
 
-# === WebSocket ===
+
+# ── Dead Letter Queue ─────────────────────────────────────────────────────────
+
+@app.get("/dlq", tags=["Dead Letter Queue"])
+async def get_dlq():
+    return broker.get_dlq_info()
+
+
+@app.post("/dlq/{message_id}/reprocess", tags=["Dead Letter Queue"])
+async def reprocess_dlq(message_id: str):
+    if broker.dlq and broker.dlq.reprocess_message(message_id):
+        return {"status": "reprocessed", "message_id": message_id}
+    raise HTTPException(404, "Message not found in DLQ")
+
+
+@app.delete("/dlq", tags=["Dead Letter Queue"])
+async def clear_dlq():
+    if broker.dlq:
+        broker.dlq.clear()
+        return {"status": "cleared"}
+    raise HTTPException(404, "DLQ not available")
+
+
+# ── WebSocket ─────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws/{subscriber_id}")
 async def websocket_endpoint(websocket: WebSocket, subscriber_id: str):
-    """WebSocket для получения сообщений в реальном времени"""
+    """
+    WebSocket protocol:
+
+    CLIENT → SERVER:
+      {"action": "subscribe", "channel_type": "topic", "channel_name": "<name>"}
+      {"action": "ack", "message_id": "<id>", "channel_type": "topic", "channel_name": "<name>"}
+      {"action": "ping"}
+
+    SERVER → CLIENT:
+      message dict (same as to_dict()) with fields: id, offset, topic, content, …
+    """
     await websocket.accept()
 
+    loop = asyncio.get_event_loop()
     subscriber = broker.create_subscriber(subscriber_id, websocket)
-    print(f"🔌 [WS] WebSocket connected for subscriber {subscriber_id}")
+    subscriber.set_event_loop(loop)
+    print(f"[WS] Connected: {subscriber_id}")
+
+    # Track which channels this WS session subscribed to (for ACK routing)
+    ws_channels: Dict[str, Dict] = {}  # message_id → {channel_type, channel_name}
 
     try:
         while True:
-            data = await websocket.receive_text()
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            action = msg.get("action")
+
+            if action == "subscribe":
+                ch_type = msg.get("channel_type", "topic")
+                ch_name = msg.get("channel_name", "")
+                if not ch_name or ch_type != "topic":
+                    continue
+                broker.create_subscription(subscriber_id, ch_type, ch_name)
+                # Replay happens inside create_subscription → add_subscriber
+                await websocket.send_json(
+                    {"action": "subscribed", "channel_type": ch_type, "channel_name": ch_name}
+                )
+                print(f"[WS] {subscriber_id} subscribed to {ch_type}:{ch_name}")
+
+            elif action == "ack":
+                message_id = msg.get("message_id", "")
+                ch_type = msg.get("channel_type", "topic")
+                ch_name = msg.get("channel_name", "")
+                if message_id and ch_name and ch_type == "topic":
+                    broker.ack(subscriber_id, ch_type, ch_name, message_id)
+
+            elif action == "ping":
+                await websocket.send_json({"action": "pong"})
+
     except WebSocketDisconnect:
-        print(f"🔌 [WS] WebSocket disconnected for subscriber {subscriber_id}")
+        print(f"[WS] Disconnected: {subscriber_id}")
     except Exception as e:
-        print(f"❌ [WS] WebSocket error for subscriber {subscriber_id}: {e}")
+        print(f"[WS] Error for {subscriber_id}: {e}")
     finally:
         if subscriber_id in broker.subscribers:
             broker.subscribers[subscriber_id].websocket = None
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+            broker.subscribers[subscriber_id]._loop = None

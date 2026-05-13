@@ -1,0 +1,54 @@
+{
+  "topics": [
+    {
+      "name": "news"
+    }
+  ],
+  "queues": [
+    {
+      "name": "tasks",
+      "type": "FIFO"
+    },
+    {
+      "name": "urgent-tasks",
+      "type": "LIFO"
+    }
+  ],
+  "subscriptions": [
+    {
+      "id": "fa748227-0da9-4cd6-b76c-6abbb284db09",
+      "subscriber_id": "subscriber-1",
+      "target_type": "topic",
+      "target_name": "news",
+      "created_at": "2026-05-13T11:50:35.355139"
+    },
+    {
+      "id": "b4d091d7-45e3-4312-9a94-b7445ec31f94",
+      "subscriber_id": "subscriber-2",
+      "target_type": "topic",
+      "target_name": "news",
+      "created_at": "2026-05-13T11:50:35.356220"
+    },
+    {
+      "id": "cc1d707d-f2ad-4549-abe3-50dcf51cfd9a",
+      "subscriber_id": "worker-1",
+      "target_type": "queue",
+      "target_name": "tasks",
+      "created_at": "2026-05-13T11:50:35.363200"
+    },
+    {
+      "id": "640aa5f8-a1f4-4edc-b976-494d06d913ae",
+      "subscriber_id": "worker-2",
+      "target_type": "queue",
+      "target_name": "tasks",
+      "created_at": "2026-05-13T11:50:35.364317"
+    },
+    {
+      "id": "5ec99fdc-c416-464c-9ff8-793a6ffa309f",
+      "subscriber_id": "urgent-worker",
+      "target_type": "queue",
+      "target_name": "urgent-tasks",
+      "created_at": "2026-05-13T11:50:35.365466"
+    }
+  ]
+}
