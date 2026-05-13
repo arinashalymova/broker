@@ -28,7 +28,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from client import BrokerPublisher, BrokerSubscriber
 
 BROKER_HTTP = os.getenv("BROKER_URL", "http://localhost:8000/api/v1")
-BROKER_WS_BASE = BROKER_HTTP.replace("/api/v1", "")
+BROKER_WS_BASE = (
+    BROKER_HTTP.replace("http://", "ws://")
+    .replace("https://", "wss://")
+    .replace("/api/v1", "")
+)
 TOPIC = "persist-test"
 
 received_ids: list = []
